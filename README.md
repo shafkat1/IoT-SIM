@@ -10,60 +10,75 @@ This repo does **not** implement SUT internals. It focuses on the **contract** b
 
 ## Architecture (AWS commands, Azure results)
 
+**Primary design:** Robot runs on **AWS EC2**, publishes test steps to **AWS IoT Core**, Pis consume commands over MQTT, the **SUT** (outside this repo) eventually produces state that lands in **Azure Blob Storage** as JSON. Robot **polls** Blob on an interval you configure, **compares** JSON to expected values, and records outcomes via standard **Robot reports**.
+
 ```mermaid
 flowchart TB
   subgraph corp [Corporate network]
-    TC[Test scenarios / expected results]
+    TC[Test scenarios and expected JSON]
   end
 
   subgraph aws [AWS Cloud]
     EC2[EC2 - Robot Framework]
     LIB[IotTestBridge library]
-    IOT[AWS IoT Core]
-    CW[CloudWatch Logs / metrics]
+    IOT[AWS IoT Core - MQTT commands]
+    CW[CloudWatch optional]
     EC2 --> LIB
-    LIB -->|iot-data Publish MQTT| IOT
-    IOT --> CW
+    LIB -->|boto3 iot-data Publish| IOT
+    IOT -.->|metrics logs| CW
   end
 
-  subgraph azure [Microsoft Azure]
-    BLOB[(Azure Blob Storage - result JSON)]
+  subgraph azure [Microsoft Azure - results system]
+    AIH[Azure IoT Hub optional]
+    BLOB[(Azure Blob Storage JSON results)]
+    AIH -->|message routing export Function etc.| BLOB
   end
 
-  subgraph edge [Test installation]
-    RPi[Raspberry Pi - simulator subscriber]
+  subgraph edge [Physical test installation]
+    RPi[Raspberry Pi simulator]
     SUT[SUT - black box]
     RPi -->|GPIO / RS232| SUT
-    SUT -.->|per your pipeline e.g. IoT Hub| BLOB
+    SUT -.->|telemetry per your stack| AIH
+    SUT -.->|or other path to same blobs| BLOB
   end
 
-  IOT -->|Subscribe command topic| RPi
-  LIB -->|HTTPS poll blob| BLOB
+  IOT -->|MQTT subscribe command topic| RPi
+  LIB -->|HTTPS poll e.g. every 2-5 min| BLOB
   TC --> EC2
-  EC2 -->|PASS / FAIL reports| TC
+  EC2 -->|PASS FAIL log report output| TC
 ```
 
 ### Sequence (one step)
 
 ```mermaid
 sequenceDiagram
+  autonumber
   participant RF as Robot on EC2
+  participant Lib as IotTestBridge
   participant IoT as AWS IoT Core
   participant Pi as Raspberry Pi
   participant SUT as SUT
+  participant AzHub as Azure IoT Hub
   participant Blob as Azure Blob Storage
 
-  RF->>IoT: Publish step JSON topic=commands
-  IoT->>Pi: Deliver MQTT message
-  Pi->>SUT: Hardware stimulus
-  Note over SUT,Blob: SUT / gateway writes JSON via your Azure pipeline
-  SUT->>Blob: Put blob e.g. device_scenario.json
-  loop Poll until timeout
-    RF->>Blob: Download if exists
+  RF->>Lib: Publish Iot Step Aws
+  Lib->>IoT: MQTT publish JSON envelope
+  IoT->>Pi: Deliver command to simulator
+  Pi->>SUT: Hardware stimulus GPIO RS232
+  Note over SUT,Blob: SUT stack writes results outside this repo optional path via IoT Hub
+  SUT->>AzHub: Device telemetry when used
+  AzHub->>Blob: Routing writes e.g. device_scenario.json
+  loop Poll until blob exists or timeout
+    RF->>Blob: Wait For Result Blob HTTPS
   end
-  RF->>RF: Compare JSON to expected DeepDiff
-  RF->>RF: Robot PASS/FAIL + report artifacts
+  RF->>Lib: Compare Json To Expected
+  Lib-->>RF: PASS or AssertionError FAIL
+  Note right of RF: Robot report.html log.html output.xml
 ```
+
+### Optional all-AWS results
+
+If results are written to **Amazon S3** instead of Blob, use **`Wait For Result S3`** in the library; the command path can stay on **AWS IoT Core** unchanged.
 
 ---
 
