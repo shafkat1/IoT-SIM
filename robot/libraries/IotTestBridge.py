@@ -1,4 +1,4 @@
-"""Robot Framework library: MQTT (optional) + AWS IoT Core publish + S3 poll/compare."""
+"""Robot Framework library: AWS IoT Core (commands) + optional S3 or Azure Blob (results)."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ import uuid
 from typing import Any, Dict, Optional
 
 import paho.mqtt.client as mqtt
+from azure.identity import DefaultAzureCredential
+from azure.storage.blob import BlobServiceClient
 
 try:
     import boto3
@@ -20,7 +22,10 @@ except ImportError:  # pragma: no cover
 
 
 class IotTestBridge:
-    """Keywords for simulator commands (MQTT or AWS IoT) and S3-backed result JSON."""
+    """
+    Keywords for simulator commands (MQTT / AWS IoT) and result JSON from
+    **Amazon S3** and/or **Azure Blob Storage** (hybrid cloud is supported).
+    """
 
     ROBOT_LIBRARY_SCOPE = "GLOBAL"
 
@@ -30,6 +35,7 @@ class IotTestBridge:
         self._iot_data = None
         self._s3 = None
         self._s3_region: Optional[str] = None
+        self._blob_service: Optional[BlobServiceClient] = None
 
     # --- Optional: generic MQTT (e.g. private broker on VPC) ---
 
@@ -138,7 +144,7 @@ class IotTestBridge:
         self._iot_data.publish(topic=topic, qos=qos, payload=data.decode("utf-8"))
         return body["run_id"]
 
-    # --- Amazon S3 (result JSON written by IoT Rules, Lambda, or your pipeline) ---
+    # --- Amazon S3 (optional; all-AWS result path) ---
 
     def configure_aws_s3(self, region: Optional[str] = None) -> None:
         """Create an S3 client using the default credential chain (EC2 instance role, env, profile)."""
@@ -161,7 +167,6 @@ class IotTestBridge:
     ) -> str:
         """
         Poll until ``s3://bucket/key`` exists, then return object body as UTF-8 text.
-        Typical key: ``{device_id}_{scenario_id}.json`` (match your IoT Rule prefix).
         """
         if self._s3 is None:
             self.configure_aws_s3()
@@ -182,6 +187,61 @@ class IotTestBridge:
                 last_err = exc
                 time.sleep(poll_seconds)
         msg = f"S3 object not found in time: s3://{bucket}/{key}"
+        if last_err:
+            msg += f" (last error: {last_err})"
+        raise AssertionError(msg)
+
+    # --- Azure Blob Storage (optional; results in a separate system) ---
+
+    def connect_blob_from_connection_string(self, connection_string: str) -> None:
+        """Authenticate to Azure Storage using a connection string."""
+        self._blob_service = BlobServiceClient.from_connection_string(connection_string)
+
+    def connect_blob_default_credential(self, account_url: str) -> None:
+        """Use DefaultAzureCredential (managed identity, Azure CLI, workload identity, etc.)."""
+        cred = DefaultAzureCredential(exclude_interactive_browser_credential=False)
+        self._blob_service = BlobServiceClient(account_url, credential=cred)
+
+    def _blob_service_client(self) -> BlobServiceClient:
+        if self._blob_service is None:
+            cs = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+            url = os.environ.get("AZURE_STORAGE_ACCOUNT_URL")
+            if cs:
+                self._blob_service = BlobServiceClient.from_connection_string(cs)
+            elif url:
+                self.connect_blob_default_credential(url)
+            else:
+                raise RuntimeError(
+                    "Configure Azure Blob: Connect Blob From Connection String / "
+                    "Connect Blob Default Credential, or set "
+                    "AZURE_STORAGE_CONNECTION_STRING / AZURE_STORAGE_ACCOUNT_URL."
+                )
+        return self._blob_service
+
+    def wait_for_result_blob(
+        self,
+        container: str,
+        blob_name: str,
+        poll_seconds: float = 120.0,
+        timeout_seconds: float = 3600.0,
+    ) -> str:
+        """
+        Poll until ``container/blob_name`` exists in Azure Blob Storage, then return UTF-8 text.
+        Typical blob name: ``{device_id}_{scenario_id}.json`` (match your IoT Hub / pipeline).
+        """
+        svc = self._blob_service_client()
+        container_client = svc.get_container_client(container)
+        deadline = time.monotonic() + timeout_seconds
+        last_err: Optional[Exception] = None
+        while time.monotonic() < deadline:
+            try:
+                blob = container_client.get_blob_client(blob_name)
+                if blob.exists():
+                    return blob.download_blob().readall().decode("utf-8")
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+            time.sleep(poll_seconds)
+        msg = f"Blob not found in time: {container}/{blob_name}"
         if last_err:
             msg += f" (last error: {last_err})"
         raise AssertionError(msg)
