@@ -171,9 +171,3 @@ requirements.txt
 ## Polling behaviour
 
 `Wait For Result S3` polls until the object exists or `timeout_seconds` elapses. Default `poll_seconds=120` matches a slow SUT cadence; override for faster feedback in CI.
-
----
-
-## License
-
-Specify your organization’s default license if this repository will be shared outside your team.
